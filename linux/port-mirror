@@ -1,0 +1,142 @@
+#!/bin/bash
+# 
+# Mirror traffic from an interface to a GRE tunnel
+#
+# Copyright (C) 2017 Stealth Security, Inc - All Rights Reserved
+# Unauthorized copying of this file, via any medium is strictly prohibited
+#
+GRE_IF=gre1
+
+function get_mirror_interface() {
+  echo ${1}mirror
+}
+
+function get_tap_interface() {
+  echo ${1}tap
+}
+
+function setup_port_mirror() {
+  local SRC_IF=$1
+  local DST_IF=$2
+
+  # ingress
+  sudo tc qdisc add dev "$SRC_IF" ingress
+  sudo tc filter add dev "$SRC_IF" parent ffff: \
+    protocol all prio 1 u32 \
+    match ip protocol 47 0xff flowid 1:1 \
+    action pass
+  sudo tc filter add dev "$SRC_IF" parent ffff: \
+    protocol all prio 2 u32 \
+    match u32 0 0 flowid 1:2 \
+    action mirred egress mirror dev "$DST_IF"
+
+
+  # egress
+  sudo tc qdisc replace dev "$SRC_IF" parent root handle 10: prio
+  sudo tc filter add dev "$SRC_IF" parent 10: \
+    protocol all prio 1 u32 \
+    match ip protocol 47 0xff flowid 10:1 \
+    action pass
+  sudo tc filter add dev "$SRC_IF" parent 10: \
+    protocol all prio 2 u32 \
+    match u32 0 0 flowid 10:2 \
+    action mirred egress mirror dev "$DST_IF"
+}
+
+function teardown_port_mirror() {
+  local SRC_IF=$1
+
+  # ingress
+  sudo tc qdisc del dev "$SRC_IF" ingress
+
+  # egress
+  sudo tc qdisc del dev "$SRC_IF" root
+}
+
+function setup_virtual_tap() {
+  local ETH=$1
+  local MIRROR=`get_mirror_interface ${ETH}`
+  local TAP=`get_tap_interface ${ETH}`
+  sudo ip li ad ${TAP} type veth peer name ${MIRROR}
+  sudo ip li set dev ${TAP} up promisc on arp off
+  sudo ip li set dev ${MIRROR} up promisc on arp off
+}
+
+function teardown_virtual_tap() {
+  local ETH=$1
+  local TAP=`get_tap_interface ${ETH}`
+  sudo ip li delete ${TAP} 
+}
+
+function setup_gre() {
+  local LOCAL_IP=$1
+  local REMOTE_IP=$2
+   
+  sudo modprobe ip_gre
+  sudo ip tunnel add ${GRE_IF} mode gre remote ${REMOTE_IP} local ${LOCAL_IP} ttl 255
+  sudo ip link set ${GRE_IF} up
+}
+
+function teardown_gre() {
+  sudo ip link delete ${GRE_IF}
+}
+
+function help() {
+  echo "port-mirror"
+  echo "  -i <interface> : mirror interface e.g. eth0"
+  echo "  -g <interface> : (optional) gre interface e.g. gre2. (default: gre1)"
+  echo "  -l <local ip>  : local gre tunnel endpoint"
+  echo "  -r <remote ip> : remote gre tunnel endpoint"
+  echo "  -d             : teardown port mirror"
+  echo "  -h             : help"
+  echo "examples:"
+  echo "  port-mirror -i eth0 -l 1.2.3.4 -r 1.2.3.5"
+  echo "  port-mirror -i eth0 -l 1.2.3.4 -r 1.2.3.5 -g gre2"
+  echo "  port-mirror -d -i eth0"
+  echo "  port-mirror -d -i eth0 -g gre2"
+}
+
+ETH_IF=eth0
+PORT_MIRROR_TEARDOWN=false
+
+if [ "$#" -eq 0 ]; then
+  help
+  exit
+fi
+
+
+while getopts "dg:hi:l:r:" opt; do
+  case $opt in
+    d) PORT_MIRROR_TEARDOWN=true
+       ;;
+    h) help
+       ;;
+    g) GRE_IF=$OPTARG
+       ;;
+    i) ETH_IF=$OPTARG
+       ;;
+    l) LOCAL_IP=$OPTARG
+       ;;
+    r) REMOTE_IP=$OPTARG
+       ;;
+  esac
+done
+
+if [ "${PORT_MIRROR_TEARDOWN}" = false ]; then
+  setup_virtual_tap ${ETH_IF}
+
+  MIRROR_IF=`get_mirror_interface ${ETH_IF}`
+  setup_port_mirror ${ETH_IF} ${MIRROR_IF}
+
+  setup_gre ${LOCAL_IP} ${REMOTE_IP}
+
+  TAP_IF=`get_tap_interface ${ETH_IF}`
+  setup_port_mirror ${TAP_IF} ${GRE_IF}
+else
+  # teardown 
+  teardown_gre 
+  TAP_IF=`get_tap_interface ${ETH_IF}`
+  teardown_port_mirror ${TAP_IF}
+  teardown_port_mirror ${ETH_IF}
+  teardown_virtual_tap ${ETH_IF}
+fi
